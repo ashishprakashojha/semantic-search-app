@@ -3,24 +3,24 @@ from pydantic import BaseModel
 import numpy as np
 import time
 import os
-from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
 # ----------------------------
 # CONFIG
 # ----------------------------
 
-DOC_FOLDER = "docs"
-LLM_MODEL = "gpt-4o-mini"  # Used only if rerank=True
+EMBED_MODEL = "text-embedding-3-small"
+LLM_MODEL = "gpt-4o-mini"
 
-app = FastAPI()
 client = OpenAI()
 
-# ----------------------------
-# LOAD LOCAL EMBEDDING MODEL
-# ----------------------------
+app = FastAPI()
 
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+DOC_FOLDER = "docs"
+
+documents = []
+doc_embeddings = []
+
 
 # ----------------------------
 # LOAD DOCUMENTS
@@ -28,9 +28,7 @@ embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 def load_documents():
     docs = []
-
     if not os.path.exists(DOC_FOLDER):
-        print("⚠ 'docs' folder not found")
         return docs
 
     for filename in os.listdir(DOC_FOLDER):
@@ -41,21 +39,22 @@ def load_documents():
                     "content": f.read(),
                     "metadata": {"source": filename}
                 })
-
-    print(f"Loaded {len(docs)} documents")
     return docs
 
 
-documents = load_documents()
-doc_embeddings = None  # Lazy initialization
-
-
-# ----------------------------
-# EMBEDDING FUNCTION (LOCAL)
-# ----------------------------
-
 def embed_texts(texts):
-    return embedder.encode(texts)
+    response = client.embeddings.create(
+        model=EMBED_MODEL,
+        input=texts
+    )
+    return [np.array(e.embedding) for e in response.data]
+
+
+# Load once at startup
+documents = load_documents()
+
+if documents:
+    doc_embeddings = embed_texts([doc["content"] for doc in documents])
 
 
 # ----------------------------
@@ -74,16 +73,14 @@ class SearchRequest(BaseModel):
 # ----------------------------
 
 def cosine_similarity(a, b):
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 
 # ----------------------------
-# OPTIONAL LLM RERANKING
+# RERANK FUNCTION
 # ----------------------------
 
 def rerank_results(query, results):
-    reranked = []
-
     for r in results:
         prompt = f"""
 Query: "{query}"
@@ -94,24 +91,16 @@ Rate relevance from 0-10.
 Respond only with the number.
 """
 
-        try:
-            response = client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0
-            )
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
 
-            score = float(response.choices[0].message.content.strip())
-            normalized = max(0.0, min(score / 10.0, 1.0))
+        score = float(response.choices[0].message.content.strip())
+        r["score"] = round(score / 10.0, 4)
 
-        except Exception:
-            # fallback to similarity score if API fails
-            normalized = r["score"]
-
-        r["score"] = round(normalized, 4)
-        reranked.append(r)
-
-    return sorted(reranked, key=lambda x: x["score"], reverse=True)
+    return sorted(results, key=lambda x: x["score"], reverse=True)
 
 
 # ----------------------------
@@ -120,11 +109,9 @@ Respond only with the number.
 
 @app.post("/")
 def search(request: SearchRequest):
-    global doc_embeddings
-
     start = time.time()
 
-    if len(documents) == 0:
+    if not documents:
         return {
             "results": [],
             "reranked": False,
@@ -134,20 +121,21 @@ def search(request: SearchRequest):
             }
         }
 
-    # Compute embeddings once
-    if doc_embeddings is None:
-        doc_embeddings = embed_texts([doc["content"] for doc in documents])
-
     # Embed query
-    query_embedding = embed_texts([request.query])[0]
+    query_embedding = client.embeddings.create(
+        model=EMBED_MODEL,
+        input=request.query
+    ).data[0].embedding
 
-    # Compute cosine similarities
+    query_embedding = np.array(query_embedding)
+
+    # Compute similarities
     similarities = []
     for i, doc_embedding in enumerate(doc_embeddings):
         score = cosine_similarity(query_embedding, doc_embedding)
         similarities.append((i, score))
 
-    # Normalize similarity scores to 0-1
+    # Normalize scores 0-1
     scores_only = [s[1] for s in similarities]
     min_score = min(scores_only)
     max_score = max(scores_only)
@@ -160,10 +148,7 @@ def search(request: SearchRequest):
             norm = (score - min_score) / (max_score - min_score)
         normalized.append((idx, norm))
 
-    # Sort descending
     normalized.sort(key=lambda x: x[1], reverse=True)
-
-    # Top K
     top_k = normalized[:request.k]
 
     results = []
@@ -175,7 +160,6 @@ def search(request: SearchRequest):
             "metadata": documents[idx]["metadata"]
         })
 
-    # Rerank if enabled
     if request.rerank:
         results = rerank_results(request.query, results)
         results = results[:request.rerankK]
