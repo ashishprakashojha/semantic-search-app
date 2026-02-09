@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
 import time
@@ -16,15 +17,23 @@ client = OpenAI()
 
 app = FastAPI()
 
-DOC_FOLDER = "docs"
+# ----------------------------
+# CORS (IMPORTANT FOR RENDER)
+# ----------------------------
 
-documents = []
-doc_embeddings = []
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ----------------------------
 # LOAD DOCUMENTS
 # ----------------------------
+
+DOC_FOLDER = "docs"
 
 def load_documents():
     docs = []
@@ -41,6 +50,12 @@ def load_documents():
                 })
     return docs
 
+documents = load_documents()
+doc_embeddings = []
+
+# ----------------------------
+# EMBEDDING FUNCTION
+# ----------------------------
 
 def embed_texts(texts):
     response = client.embeddings.create(
@@ -48,14 +63,6 @@ def embed_texts(texts):
         input=texts
     )
     return [np.array(e.embedding) for e in response.data]
-
-
-# Load once at startup
-documents = load_documents()
-
-if documents:
-    doc_embeddings = embed_texts([doc["content"] for doc in documents])
-
 
 # ----------------------------
 # REQUEST MODEL
@@ -67,7 +74,6 @@ class SearchRequest(BaseModel):
     rerank: bool = True
     rerankK: int = 5
 
-
 # ----------------------------
 # COSINE SIMILARITY
 # ----------------------------
@@ -75,20 +81,21 @@ class SearchRequest(BaseModel):
 def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-
 # ----------------------------
 # RERANK FUNCTION
 # ----------------------------
 
 def rerank_results(query, results):
+    scores = []
+
     for r in results:
         prompt = f"""
 Query: "{query}"
 
 Document: "{r['content']}"
 
-Rate relevance from 0-10.
-Respond only with the number.
+Rate the relevance from 0-10.
+Respond ONLY with the number.
 """
 
         response = client.chat.completions.create(
@@ -97,11 +104,25 @@ Respond only with the number.
             temperature=0
         )
 
-        score = float(response.choices[0].message.content.strip())
-        r["score"] = round(score / 10.0, 4)
+        try:
+            score = float(response.choices[0].message.content.strip())
+        except:
+            score = 5.0
+
+        scores.append(score / 10.0)
+
+    for i in range(len(results)):
+        results[i]["score"] = round(scores[i], 4)
 
     return sorted(results, key=lambda x: x["score"], reverse=True)
 
+# ----------------------------
+# HEALTH CHECK (IMPORTANT)
+# ----------------------------
+
+@app.get("/")
+def health():
+    return {"status": "running", "totalDocs": len(documents)}
 
 # ----------------------------
 # SEARCH ENDPOINT
@@ -121,6 +142,10 @@ def search(request: SearchRequest):
             }
         }
 
+    global doc_embeddings
+    if not doc_embeddings:
+        doc_embeddings = embed_texts([doc["content"] for doc in documents])
+
     # Embed query
     query_embedding = client.embeddings.create(
         model=EMBED_MODEL,
@@ -135,7 +160,7 @@ def search(request: SearchRequest):
         score = cosine_similarity(query_embedding, doc_embedding)
         similarities.append((i, score))
 
-    # Normalize scores 0-1
+    # Normalize scores
     scores_only = [s[1] for s in similarities]
     min_score = min(scores_only)
     max_score = max(scores_only)
