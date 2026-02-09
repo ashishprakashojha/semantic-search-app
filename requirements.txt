@@ -3,5 +3,4 @@ uvicorn
 openai
 numpy
 pydantic
-torch
-sentence-transformers
+
